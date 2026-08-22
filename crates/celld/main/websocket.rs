@@ -976,7 +976,7 @@ pub(crate) async fn handle_peer_websocket(
 pub(crate) async fn handle_websocket(mut request: Request<Incoming>, app: AppHandle) -> HttpReply {
     let started = Instant::now();
     let request_id = celld::js::next_request_id();
-    let (upgrade_response, upgrade) = match fastwebsockets::upgrade::upgrade(&mut request) {
+    let (mut upgrade_response, upgrade) = match fastwebsockets::upgrade::upgrade(&mut request) {
         Ok(upgrade) => upgrade,
         Err(error) => return response(StatusCode::BAD_REQUEST, format!("ws upgrade: {error}")),
     };
@@ -1047,6 +1047,16 @@ pub(crate) async fn handle_websocket(mut request: Request<Incoming>, app: AppHan
         );
         return response(StatusCode::BAD_GATEWAY, "unsupported WebSocket route");
     }
+    // `fastwebsockets::upgrade::upgrade` builds this response from the
+    // request alone, before the Worker runs, and by its own documented
+    // contract never inspects or sets Sec-WebSocket-Protocol. A Worker that
+    // accepts a subprotocol reports its choice on the 101 it returns for the
+    // Durable Object's WebSocket, but that response is otherwise discarded
+    // once its `ws` target is taken above -- so the negotiated subprotocol
+    // never reached the client. RFC 6455 4.1 requires a client that offered
+    // subprotocols to fail the connection when the handshake response omits
+    // one, which is exactly the silent 1006 this closes.
+    apply_negotiated_subprotocol(&mut upgrade_response, &worker_response.headers);
     emit_websocket_connection_timing(
         runtime,
         request_id,
@@ -1146,4 +1156,96 @@ mod tunnel_cancel_private {
 #[cfg(all(test, celld_internal_tests))]
 mod socket_cancel_private {
     include!(env!("CELLD_CONFORMANCE_SOCKET_CANCEL_TESTS"));
+}
+
+/// `fastwebsockets::upgrade::upgrade` builds `upgrade_response` from the
+/// request alone, before the Worker runs, and its own contract is that it
+/// never inspects or sets `Sec-WebSocket-Protocol`. A Worker's 101 for the
+/// Durable Object's WebSocket is the only place a negotiated subprotocol is
+/// recorded, so it has to be copied onto the client-facing response by hand
+/// -- otherwise a client that offered subprotocols fails the handshake per
+/// RFC 6455 4.1, since the response omits the header entirely.
+fn apply_negotiated_subprotocol<B>(
+    upgrade_response: &mut Response<B>,
+    worker_headers: &[(String, String)],
+) {
+    let Some((_, value)) = worker_headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("sec-websocket-protocol"))
+    else {
+        return;
+    };
+    if let Ok(value) = hyper::header::HeaderValue::from_str(value) {
+        upgrade_response
+            .headers_mut()
+            .insert(hyper::header::SEC_WEBSOCKET_PROTOCOL, value);
+    }
+}
+
+#[cfg(test)]
+mod negotiated_subprotocol_tests {
+    use super::apply_negotiated_subprotocol;
+    use http_body_util::Empty;
+    use hyper::body::Bytes;
+    use hyper::{header::SEC_WEBSOCKET_PROTOCOL, Response};
+
+    fn bare_upgrade_response() -> Response<Empty<Bytes>> {
+        // What `fastwebsockets::upgrade::upgrade` hands back before this
+        // function touches it: a 101 with no Sec-WebSocket-Protocol.
+        Response::builder()
+            .status(101)
+            .body(Empty::new())
+            .expect("static test response")
+    }
+
+    #[test]
+    fn copies_the_workers_negotiated_subprotocol_onto_the_upgrade_response() {
+        let mut response = bare_upgrade_response();
+        let headers = vec![(
+            "sec-websocket-protocol".to_string(),
+            "agent-relay.v1".to_string(),
+        )];
+
+        apply_negotiated_subprotocol(&mut response, &headers);
+
+        assert_eq!(
+            response.headers().get(SEC_WEBSOCKET_PROTOCOL).unwrap(),
+            "agent-relay.v1"
+        );
+    }
+
+    #[test]
+    fn matches_the_header_case_insensitively_like_every_other_http_header() {
+        let mut response = bare_upgrade_response();
+        let headers = vec![("Sec-WebSocket-Protocol".to_string(), "chat.v2".to_string())];
+
+        apply_negotiated_subprotocol(&mut response, &headers);
+
+        assert_eq!(
+            response.headers().get(SEC_WEBSOCKET_PROTOCOL).unwrap(),
+            "chat.v2"
+        );
+    }
+
+    #[test]
+    fn leaves_the_response_untouched_when_the_worker_never_selected_a_subprotocol() {
+        let mut response = bare_upgrade_response();
+
+        apply_negotiated_subprotocol(&mut response, &[]);
+
+        assert!(response.headers().get(SEC_WEBSOCKET_PROTOCOL).is_none());
+    }
+
+    #[test]
+    fn drops_a_value_that_cannot_be_a_header_rather_than_panicking() {
+        let mut response = bare_upgrade_response();
+        let headers = vec![(
+            "sec-websocket-protocol".to_string(),
+            "bad\nvalue".to_string(),
+        )];
+
+        apply_negotiated_subprotocol(&mut response, &headers);
+
+        assert!(response.headers().get(SEC_WEBSOCKET_PROTOCOL).is_none());
+    }
 }
