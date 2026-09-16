@@ -14,6 +14,13 @@ exhaustively model-checked specification, and we test it with
 deterministic simulation. We test the full system with fault injection
 on live fleets.
 
+## Public peer-tunnel regressions
+
+The [peer-tunnel retry tests](peer-tunnel-retry.md) use the real transport against
+an HTTP peer to guard against buffered mutation replay after response loss. They
+are component tests, not storage or full-fleet evidence; their build requirements,
+prepared-source status and remaining coverage gaps are documented separately.
+
 ## Conformance: two runtimes, one output
 
 We test the compatibility promise differentially. We run each Workers and
