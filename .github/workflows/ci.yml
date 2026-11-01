@@ -10,7 +10,47 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      CELLD_LTX_S3_ENDPOINT: http://127.0.0.1:7070
+      CELLD_LTX_S3_BUCKET: celld-ltx
+      CELLD_LTX_S3_REQUIRED: '1'
+      CELLD_LTX_LITESTREAM_REQUIRED: '1'
+      AWS_REGION: us-east-1
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Prepare isolated S3 fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Disposable fixture credentials, generated independently for this runner.
+          access="fixture${GITHUB_RUN_ID}"
+          password="$(openssl rand -hex 24)"
+          echo "::add-mask::$password"
+          printf 'AWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\n' "$access" "$password" >> "$GITHUB_ENV"
+          docker run -d --name celld-s3 -p 127.0.0.1:7070:9000 \
+            -e MINIO_ROOT_USER="$access" -e MINIO_ROOT_PASSWORD="$password" \
+            minio/minio:RELEASE.2025-09-07T16-13-09Z server /data >/dev/null
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:7070/minio/health/live >/dev/null; then break; fi
+            sleep 1
+          done
+          AWS_ACCESS_KEY_ID="$access" AWS_SECRET_ACCESS_KEY="$password" \
+            aws --endpoint-url "$CELLD_LTX_S3_ENDPOINT" s3api create-bucket --bucket "$CELLD_LTX_S3_BUCKET"
+      - name: Install pinned Litestream oracle in runner temp
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v sqlite3 >/dev/null
+          version=$(sed -n 's/.*PINNED_LITESTREAM_VERSION: \&str = "\([^"]*\)".*/\1/p' crates/ltx/tests/differential_xtool.rs)
+          test -n "$version"
+          archive="litestream-${version}-linux-x86_64.tar.gz"
+          cd "$RUNNER_TEMP"
+          base="https://github.com/benbjohnson/litestream/releases/download/v${version}"
+          curl -fsSLO "$base/$archive"
+          curl -fsSLO "$base/checksums.txt"
+          grep "  $archive\$" checksums.txt | sha256sum -c -
+          mkdir -p litestream-bin
+          tar -xzf "$archive" -C litestream-bin litestream
+          echo "$RUNNER_TEMP/litestream-bin" >> "$GITHUB_PATH"
       - run: cargo test --workspace --locked
